@@ -37,10 +37,15 @@ function formatKR(dateStr: string) {
   return `${y}.${String(m).padStart(2, "0")}.${String(d).padStart(2, "0")} (${days[dt.getDay()]})`;
 }
 
-const CART_KEY = "ssanjae_cart_v1"; // { [productId]: qty }
-const CHECKOUT_KEY = "ssanjae_checkout_v1"; // { selectedDate, cart }
-
 export default function ProductsPage() {
+  // ✅ 0) 로컬 임시 로그인 가드 (import 위에 두면 100% 에러, useEffect 안이 정답)
+  useEffect(() => {
+    if (localStorage.getItem("ssanjae_login") !== "ok") {
+      location.href = "/auth";
+      return;
+    }
+  }, []);
+
   const supabase = useMemo(() => getSupabase(), []);
 
   const [loading, setLoading] = useState(true);
@@ -77,44 +82,46 @@ export default function ProductsPage() {
     return cartItems.reduce((sum, it) => sum + (it.product.price || 0) * it.qty, 0);
   }, [cartItems]);
 
-  // ✅ 로컬 장바구니 불러오기/저장
-  function loadCartFromLocal() {
-    try {
-      const raw = localStorage.getItem(CART_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") setCart(parsed as Record<number, number>);
-    } catch {
-      // ignore
-    }
-  }
-
-  function saveCartToLocal(nextCart: Record<number, number>) {
-    localStorage.setItem(CART_KEY, JSON.stringify(nextCart));
-  }
-
   async function loadPickupDates() {
     if (!supabase) {
-      setErrorMsg("Vercel 환경변수 NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY 확인해.");
+      setErrorMsg("Vercel 환경변수(NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY)부터 확인해라.");
       return;
     }
 
-    const res = await supabase
+    // 1순위: pickup_dates
+    let res = await supabase
       .from("pickup_dates")
       .select("id,pickup_date,is_open,label")
       .order("pickup_date", { ascending: true });
 
-    if (res.error) {
-      setErrorMsg("pickup_dates 테이블을 못 불러온다.");
+    if (!res.error && Array.isArray(res.data)) {
+      const openOnly = res.data
+        .filter((r: any) => r.is_open !== false)
+        .map((r: any) => r as PickupDateRow);
+
+      setDates(openOnly);
+      const first = openOnly[0]?.pickup_date || "";
+      setSelectedDate(first);
       return;
     }
 
-    const openOnly = (res.data || [])
-      .filter((r: any) => r.is_open !== false)
+    // 2순위: order_dates (혹시 예전 테이블명일 경우 대비)
+    res = await supabase
+      .from("order_dates")
+      .select("id,date,is_active,label")
+      .order("date", { ascending: true });
+
+    if (res.error) {
+      setErrorMsg(`픽업날짜 테이블을 못 불러온다. (pickup_dates / order_dates 둘 다 실패)`);
+      return;
+    }
+
+    const list = (res.data || [])
+      .filter((r: any) => r.is_active !== false)
       .map((r: any) => r as PickupDateRow);
 
-    setDates(openOnly);
-    const first = openOnly[0]?.pickup_date || "";
+    setDates(list);
+    const first = list[0]?.date || "";
     setSelectedDate(first);
   }
 
@@ -139,6 +146,7 @@ export default function ProductsPage() {
   async function loadNoticeAndTags() {
     if (!supabase) return;
 
+    // site_settings: notice_html / hashtags
     const res = await supabase
       .from("site_settings")
       .select("key,value")
@@ -163,15 +171,6 @@ export default function ProductsPage() {
   }
 
   useEffect(() => {
-    // ✅ 로그인 체크(한 가지 방식만)
-    if (localStorage.getItem("ssanjae_login") !== "ok") {
-      window.location.href = "/auth";
-      return;
-    }
-
-    // ✅ 장바구니 복구
-    loadCartFromLocal();
-
     (async () => {
       setLoading(true);
       setErrorMsg(null);
@@ -192,31 +191,26 @@ export default function ProductsPage() {
     if (!p) return;
 
     const stock = p.stock ?? 999999;
-
     setCart((prev) => {
       const cur = prev[id] || 0;
-      const nextQty = Math.min(cur + 1, stock);
-      const next = { ...prev, [id]: nextQty };
-      saveCartToLocal(next);
-      return next;
+      const next = Math.min(cur + 1, stock);
+      return { ...prev, [id]: next };
     });
   }
 
   function dec(id: number) {
     setCart((prev) => {
       const cur = prev[id] || 0;
-      const nextQty = cur - 1;
-      const next = { ...prev };
-      if (nextQty <= 0) delete next[id];
-      else next[id] = nextQty;
-      saveCartToLocal(next);
-      return next;
+      const next = cur - 1;
+      const copy = { ...prev };
+      if (next <= 0) delete copy[id];
+      else copy[id] = next;
+      return copy;
     });
   }
 
   function resetCart() {
     setCart({});
-    saveCartToLocal({});
   }
 
   function openDetail(p: ProductRow) {
@@ -229,28 +223,6 @@ export default function ProductsPage() {
     setDetailProduct(null);
   }
 
-  function goCheckout() {
-    if (!selectedDate) {
-      alert("픽업 날짜를 먼저 선택해.");
-      return;
-    }
-    if (cartItems.length === 0) {
-      alert("담은 상품이 없어.");
-      return;
-    }
-
-    // ✅ checkout 페이지에서 쓰도록 localStorage에 저장
-    localStorage.setItem(
-      CHECKOUT_KEY,
-      JSON.stringify({
-        selectedDate,
-        cart, // { [productId]: qty }
-      })
-    );
-
-    window.location.href = "/checkout";
-  }
-
   // ✅ 컬러(초록버튼)
   const GREEN = "#19b84a";
   const GREEN_SOFT = "#e9f9ee";
@@ -261,6 +233,7 @@ export default function ProductsPage() {
   const keepFont = `"Pretendard", system-ui, -apple-system, Segoe UI, Roboto`;
   const juaFont = `"BMJUA", "배민주아체", "BaeminJua", "Pretendard", system-ui, -apple-system, Segoe UI, Roboto`;
 
+  // ✅ “노란칸” 썸네일 박스 크기
   const thumbHeight = 360;
 
   return (
@@ -279,20 +252,21 @@ export default function ProductsPage() {
       <header style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12, marginBottom: 12 }}>
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {/* 로고는 /public/logo.jpg 로 넣어야 뜸 */}
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src="/logo.jpg" alt="싼재네마켓 로고" style={{ width: 26, height: 26, objectFit: "contain" }} />
             <h1 style={{ fontSize: 22, margin: 0, fontWeight: 900, fontFamily: keepFont }}>싼재네 오프라인 주문</h1>
           </div>
           <p style={{ margin: "6px 0 0 0", opacity: 0.75, fontFamily: keepFont }}>픽업 날짜 선택 → 상품 담기</p>
         </div>
-
-        {/* ✅ admin 라우트는 지금 만들지 않기로 했으니 제거 */}
-        <span style={{ fontSize: 12, opacity: 0.6 }}>v1</span>
+        <a href="/admin" style={{ fontSize: 14, opacity: 0.85, textDecoration: "underline" }}>
+          관리자
+        </a>
       </header>
 
       {!supabase && (
         <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
-          <b>환경변수부터 확인해.</b>
+          <b>환경변수부터 잡아라.</b>
           <div style={{ marginTop: 6, opacity: 0.8 }}>NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY</div>
         </div>
       )}
@@ -550,7 +524,7 @@ export default function ProductsPage() {
                 </button>
 
                 <button
-                  onClick={goCheckout}
+                  onClick={() => alert("다음 단계: /checkout 만들고 주문 저장 연결한다.")}
                   style={{
                     padding: "12px 12px",
                     borderRadius: 12,
@@ -600,11 +574,7 @@ export default function ProductsPage() {
               <div style={{ width: "100%", height: thumbHeight, background: "#f6f6f6", borderRadius: 14, overflow: "hidden", border: "1px solid #eee" }}>
                 {detailProduct.thumbnail_url ? (
                   // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={detailProduct.thumbnail_url}
-                    alt={detailProduct.name}
-                    style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }}
-                  />
+                  <img src={detailProduct.thumbnail_url} alt={detailProduct.name} style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }} />
                 ) : (
                   <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", opacity: 0.6 }}>No Image</div>
                 )}
@@ -619,7 +589,7 @@ export default function ProductsPage() {
                 <div style={{ fontSize: 21, color: "#777", fontWeight: 1000 }}>재고 {(detailProduct.stock ?? 0).toLocaleString()}</div>
               </div>
 
-              <div style={{ marginTop: 10, color: "#444", lineHeight: 1.5 }}>임시 설명</div>
+              <div style={{ marginTop: 10, color: "#444", lineHeight: 1.5 }}>맛/식감/보관법 등은 나중에 바꿀 예정입니다. (임시 설명)</div>
 
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 12 }}>
                 <button onClick={closeDetail} style={{ height: 46, borderRadius: 12, border: "1px solid #ccc", background: "#fff", fontWeight: 1000, cursor: "pointer" }}>
