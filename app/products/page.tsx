@@ -1,7 +1,17 @@
+// app/products/page.tsx
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+
+type PickupDateRow = {
+  id?: number;
+  pickup_date?: string;
+  date?: string;
+  is_open?: boolean | null;
+  is_active?: boolean | null;
+  label?: string | null;
+};
 
 type ProductRow = {
   id: number;
@@ -14,86 +24,630 @@ type ProductRow = {
 };
 
 function getSupabase(): SupabaseClient | null {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
   if (!url || !key) return null;
   return createClient(url, key);
 }
 
+function formatKR(dateStr: string) {
+  const [y, m, d] = dateStr.split("-").map((v) => Number(v));
+  const dt = new Date(y, (m || 1) - 1, d || 1);
+  const days = ["일", "월", "화", "수", "목", "금", "토"];
+  return `${y}.${String(m).padStart(2, "0")}.${String(d).padStart(2, "0")} (${days[dt.getDay()]})`;
+}
+
+const CART_KEY = "ssanjae_cart_v1"; // { [productId]: qty }
+const CHECKOUT_KEY = "ssanjae_checkout_v1"; // { selectedDate, cart }
+
 export default function ProductsPage() {
-  const [rows, setRows] = useState<ProductRow[]>([]);
+  const supabase = useMemo(() => getSupabase(), []);
+
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  const [dates, setDates] = useState<PickupDateRow[]>([]);
+  const [selectedDate, setSelectedDate] = useState<string>("");
+
+  const [products, setProducts] = useState<ProductRow[]>([]);
+  const [cart, setCart] = useState<Record<number, number>>({});
+
+  // 상세보기 모달
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailProduct, setDetailProduct] = useState<ProductRow | null>(null);
+
+  // ✅ 공지/해시태그 (DB에서 불러옴)
+  const [noticeHtml, setNoticeHtml] = useState<string>("");
+  const [hashtags, setHashtags] = useState<string[]>([]);
+
+  const cartItems = useMemo(() => {
+    const map = new Map<number, ProductRow>();
+    products.forEach((p) => map.set(p.id, p));
+    return Object.entries(cart)
+      .map(([idStr, qty]) => {
+        const id = Number(idStr);
+        const p = map.get(id);
+        if (!p) return null;
+        return { product: p, qty };
+      })
+      .filter(Boolean) as { product: ProductRow; qty: number }[];
+  }, [cart, products]);
+
+  const totalPrice = useMemo(() => {
+    return cartItems.reduce((sum, it) => sum + (it.product.price || 0) * it.qty, 0);
+  }, [cartItems]);
+
+  // ✅ 로컬 장바구니 불러오기/저장
+  function loadCartFromLocal() {
+    try {
+      const raw = localStorage.getItem(CART_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") setCart(parsed as Record<number, number>);
+    } catch {
+      // ignore
+    }
+  }
+
+  function saveCartToLocal(nextCart: Record<number, number>) {
+    localStorage.setItem(CART_KEY, JSON.stringify(nextCart));
+  }
+
+  async function loadPickupDates() {
+    if (!supabase) {
+      setErrorMsg("Vercel 환경변수 NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY 확인해.");
+      return;
+    }
+
+    const res = await supabase
+      .from("pickup_dates")
+      .select("id,pickup_date,is_open,label")
+      .order("pickup_date", { ascending: true });
+
+    if (res.error) {
+      setErrorMsg("pickup_dates 테이블을 못 불러온다.");
+      return;
+    }
+
+    const openOnly = (res.data || [])
+      .filter((r: any) => r.is_open !== false)
+      .map((r: any) => r as PickupDateRow);
+
+    setDates(openOnly);
+    const first = openOnly[0]?.pickup_date || "";
+    setSelectedDate(first);
+  }
+
+  async function loadProducts() {
+    if (!supabase) return;
+
+    const res = await supabase
+      .from("products")
+      .select("id,sort_order,name,price,stock,is_active,thumbnail_url")
+      .order("sort_order", { ascending: true })
+      .order("id", { ascending: true });
+
+    if (res.error) {
+      setErrorMsg("products 테이블을 못 불러온다.");
+      return;
+    }
+
+    const list = (res.data || []).filter((p: any) => p.is_active !== false) as ProductRow[];
+    setProducts(list);
+  }
+
+  async function loadNoticeAndTags() {
+    if (!supabase) return;
+
+    const res = await supabase
+      .from("site_settings")
+      .select("key,value")
+      .in("key", ["notice_html", "hashtags"]);
+
+    if (res.error) return;
+
+    const map = new Map<string, string>();
+    (res.data || []).forEach((r: any) => map.set(r.key, r.value));
+
+    const nh = map.get("notice_html") || "";
+    const ht = map.get("hashtags") || "";
+
+    setNoticeHtml(nh);
+
+    const parsed = ht
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    setHashtags(parsed);
+  }
+
   useEffect(() => {
-    // ✅ 로그인 체크 (localStorage 하나만)
+    // ✅ 로그인 체크(한 가지 방식만)
     if (localStorage.getItem("ssanjae_login") !== "ok") {
       window.location.href = "/auth";
       return;
     }
 
-    const supabase = getSupabase();
-    if (!supabase) {
-      setErrorMsg("Supabase 환경변수(.env.local)가 비어있음");
-      setLoading(false);
-      return;
-    }
+    // ✅ 장바구니 복구
+    loadCartFromLocal();
 
     (async () => {
       setLoading(true);
       setErrorMsg(null);
-
-      const { data, error } = await supabase
-        .from("products")
-        .select("id, sort_order, name, price, stock, is_active, thumbnail_url")
-        .order("sort_order", { ascending: true })
-        .order("id", { ascending: true });
-
-      if (error) {
-        setErrorMsg(error.message);
-        setRows([]);
-      } else {
-        setRows((data as ProductRow[]) ?? []);
-      }
-
+      await loadPickupDates();
+      await loadNoticeAndTags();
+      await loadProducts();
       setLoading(false);
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  function getDateValue(r: PickupDateRow) {
+    return r.pickup_date || r.date || "";
+  }
+
+  function inc(id: number) {
+    const p = products.find((x) => x.id === id);
+    if (!p) return;
+
+    const stock = p.stock ?? 999999;
+
+    setCart((prev) => {
+      const cur = prev[id] || 0;
+      const nextQty = Math.min(cur + 1, stock);
+      const next = { ...prev, [id]: nextQty };
+      saveCartToLocal(next);
+      return next;
+    });
+  }
+
+  function dec(id: number) {
+    setCart((prev) => {
+      const cur = prev[id] || 0;
+      const nextQty = cur - 1;
+      const next = { ...prev };
+      if (nextQty <= 0) delete next[id];
+      else next[id] = nextQty;
+      saveCartToLocal(next);
+      return next;
+    });
+  }
+
+  function resetCart() {
+    setCart({});
+    saveCartToLocal({});
+  }
+
+  function openDetail(p: ProductRow) {
+    setDetailProduct(p);
+    setDetailOpen(true);
+  }
+
+  function closeDetail() {
+    setDetailOpen(false);
+    setDetailProduct(null);
+  }
+
+  function goCheckout() {
+    if (!selectedDate) {
+      alert("픽업 날짜를 먼저 선택해.");
+      return;
+    }
+    if (cartItems.length === 0) {
+      alert("담은 상품이 없어.");
+      return;
+    }
+
+    // ✅ checkout 페이지에서 쓰도록 localStorage에 저장
+    localStorage.setItem(
+      CHECKOUT_KEY,
+      JSON.stringify({
+        selectedDate,
+        cart, // { [productId]: qty }
+      })
+    );
+
+    window.location.href = "/checkout";
+  }
+
+  // ✅ 컬러(초록버튼)
+  const GREEN = "#19b84a";
+  const GREEN_SOFT = "#e9f9ee";
+  const BLUE_TAG_BG = "#f3f8ff";
+  const BLUE_TAG_BORDER = "#b7d3ff";
+  const BLUE_TAG_TEXT = "#2b6cff";
+
+  const keepFont = `"Pretendard", system-ui, -apple-system, Segoe UI, Roboto`;
+  const juaFont = `"BMJUA", "배민주아체", "BaeminJua", "Pretendard", system-ui, -apple-system, Segoe UI, Roboto`;
+
+  const thumbHeight = 360;
+
   return (
-    <div style={{ padding: 24 }}>
-      <h1 style={{ margin: 0 }}>상품목록</h1>
+    <main style={{ maxWidth: 560, margin: "0 auto", padding: 16, fontFamily: juaFont }}>
+      <style>{`
+        @font-face {
+          font-family: "BMJUA";
+          src: url("https://cdn.jsdelivr.net/gh/projectnoonnu/noonfonts_20-04@2.1/BMJUA.woff") format("woff");
+          font-weight: normal;
+          font-style: normal;
+          font-display: swap;
+        }
+      `}</style>
 
-      <p style={{ marginTop: 8, color: "#666" }}>
-        Supabase 조회 테스트 / 로그인 체크는 localStorage만
-      </p>
+      {/* ✅ 상단: 로고 + 타이틀 */}
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12, marginBottom: 12 }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/logo.jpg" alt="싼재네마켓 로고" style={{ width: 26, height: 26, objectFit: "contain" }} />
+            <h1 style={{ fontSize: 22, margin: 0, fontWeight: 900, fontFamily: keepFont }}>싼재네 오프라인 주문</h1>
+          </div>
+          <p style={{ margin: "6px 0 0 0", opacity: 0.75, fontFamily: keepFont }}>픽업 날짜 선택 → 상품 담기</p>
+        </div>
 
-      {loading && <div style={{ marginTop: 20 }}>불러오는 중...</div>}
+        {/* ✅ admin 라우트는 지금 만들지 않기로 했으니 제거 */}
+        <span style={{ fontSize: 12, opacity: 0.6 }}>v1</span>
+      </header>
 
-      {!loading && errorMsg && (
-        <div style={{ marginTop: 20, color: "crimson" }}>
-          오류: {errorMsg}
+      {!supabase && (
+        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, marginBottom: 12 }}>
+          <b>환경변수부터 확인해.</b>
+          <div style={{ marginTop: 6, opacity: 0.8 }}>NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY</div>
         </div>
       )}
 
-      {!loading && !errorMsg && (
-        <div style={{ marginTop: 20 }}>
-          {rows.length === 0 ? (
-            <div>상품이 0개입니다. (DB에 데이터가 없거나 조회가 막힘)</div>
+      {errorMsg && (
+        <div style={{ padding: 12, border: "1px solid #f3c2c2", background: "#fff5f5", borderRadius: 12, marginBottom: 12 }}>
+          {errorMsg}
+        </div>
+      )}
+
+      <section style={{ display: "grid", gridTemplateColumns: "1fr", gap: 12 }}>
+        {/* 1) 픽업 날짜 */}
+        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 14 }}>
+          <h2 style={{ fontSize: 16, margin: 0, fontWeight: 900, fontFamily: keepFont }}>1) 픽업 날짜</h2>
+
+          {loading ? (
+            <p style={{ marginTop: 10, opacity: 0.7 }}>불러오는 중…</p>
+          ) : dates.length === 0 ? (
+            <p style={{ marginTop: 10, opacity: 0.7 }}>열린 날짜가 없다.</p>
           ) : (
-            <ul style={{ paddingLeft: 18 }}>
-              {rows.map((p) => (
-                <li key={p.id} style={{ marginBottom: 10 }}>
-                  <b>{p.name}</b>{" "}
-                  <span style={{ color: "#666" }}>
-                    / {p.price ?? "-"}원 / 재고 {p.stock ?? "-"}
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+              {dates.map((d, idx) => {
+                const value = getDateValue(d);
+                const active = value === selectedDate;
+                return (
+                  <button
+                    key={`${value}-${idx}`}
+                    onClick={() => setSelectedDate(value)}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 12,
+                      border: active ? `1px solid ${GREEN}` : "1px solid #ccc",
+                      cursor: "pointer",
+                      background: active ? GREEN : "#fff",
+                      color: active ? "#fff" : "#111",
+                      fontWeight: 900,
+                    }}
+                  >
+                    {value ? formatKR(value) : "날짜값 없음"}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          <div style={{ marginTop: 10, opacity: 0.75, fontSize: 13 }}>
+            선택됨: <b>{selectedDate ? formatKR(selectedDate) : "없음"}</b>
+          </div>
+        </div>
+
+        {/* ✅ 공지 + 해시태그 */}
+        {(noticeHtml || hashtags.length > 0) && (
+          <div style={{ padding: 12, borderRadius: 14, border: "1px solid #ddd", background: "#fff" }}>
+            {noticeHtml && (
+              <div style={{ background: GREEN_SOFT, border: `1px solid ${GREEN}`, borderRadius: 12, padding: 12 }}>
+                <div style={{ fontSize: 13, lineHeight: 1.5, fontFamily: juaFont, color: "#e00000" }}>
+                  <span dangerouslySetInnerHTML={{ __html: noticeHtml }} />
+                </div>
+              </div>
+            )}
+
+            {hashtags.length > 0 && (
+              <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {hashtags.map((t, i) => (
+                  <span
+                    key={`${t}-${i}`}
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 999,
+                      background: BLUE_TAG_BG,
+                      border: `1px solid ${BLUE_TAG_BORDER}`,
+                      color: BLUE_TAG_TEXT,
+                      fontSize: 13,
+                      fontWeight: 900,
+                    }}
+                  >
+                    {t}
                   </span>
-                </li>
-              ))}
-            </ul>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 2) 상품 */}
+        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 14 }}>
+          <h2 style={{ fontSize: 16, margin: 0, fontWeight: 900, fontFamily: keepFont }}>2) 상품</h2>
+
+          {loading ? (
+            <p style={{ marginTop: 10, opacity: 0.7 }}>불러오는 중…</p>
+          ) : products.length === 0 ? (
+            <p style={{ marginTop: 10, opacity: 0.7 }}>상품이 없다.</p>
+          ) : (
+            <div style={{ marginTop: 10, display: "grid", gap: 14 }}>
+              {products.map((p) => {
+                const qty = cart[p.id] || 0;
+                const stock = p.stock ?? 0;
+                const soldOut = stock <= 0;
+
+                return (
+                  <div key={p.id} style={{ border: "1px solid #e6e6e6", borderRadius: 16, overflow: "hidden", background: "#fff" }}>
+                    <div style={{ padding: 12 }}>
+                      <div
+                        style={{
+                          width: "100%",
+                          height: thumbHeight,
+                          background: "#f6f6f6",
+                          borderRadius: 14,
+                          overflow: "hidden",
+                          border: "1px solid #eee",
+                        }}
+                      >
+                        {p.thumbnail_url ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={p.thumbnail_url}
+                            alt={p.name}
+                            style={{
+                              width: "100%",
+                              height: "100%",
+                              objectFit: "cover",
+                              objectPosition: "center",
+                              display: "block",
+                            }}
+                          />
+                        ) : (
+                          <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", opacity: 0.6 }}>
+                            No Image
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div style={{ padding: 12, paddingTop: 0 }}>
+                      <div style={{ fontSize: 20, fontWeight: 1000, lineHeight: 1.25, wordBreak: "break-word" }}>{p.name}</div>
+
+                      <div style={{ display: "flex", gap: 12, alignItems: "baseline", marginTop: 6 }}>
+                        <div style={{ fontSize: 22, fontWeight: 1000, color: "#ff7a00" }}>{(p.price ?? 0).toLocaleString()}원</div>
+                        <div style={{ fontSize: 22, color: "#777", fontWeight: 1000 }}>재고 {stock.toLocaleString()}</div>
+                      </div>
+
+                      <div style={{ display: "grid", gridTemplateColumns: "44px 1fr 44px", gap: 8, marginTop: 10, alignItems: "center" }}>
+                        <button
+                          onClick={() => dec(p.id)}
+                          disabled={qty <= 0}
+                          style={{
+                            height: 44,
+                            borderRadius: 12,
+                            border: "1px solid #ccc",
+                            background: "#fff",
+                            fontWeight: 1000,
+                            cursor: qty <= 0 ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          -
+                        </button>
+
+                        <div style={{ height: 44, borderRadius: 12, border: "1px solid #eee", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 1000 }}>
+                          {qty}
+                        </div>
+
+                        <button
+                          onClick={() => inc(p.id)}
+                          disabled={soldOut}
+                          style={{
+                            height: 44,
+                            borderRadius: 12,
+                            border: "1px solid #ff7a00",
+                            background: soldOut ? "#f2f2f2" : "#ff7a00",
+                            color: soldOut ? "#888" : "#fff",
+                            fontWeight: 1000,
+                            cursor: soldOut ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          +
+                        </button>
+                      </div>
+
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 10 }}>
+                        <button
+                          onClick={() => openDetail(p)}
+                          style={{
+                            height: 44,
+                            borderRadius: 12,
+                            border: "1px solid #ccc",
+                            background: "#fff",
+                            fontWeight: 1000,
+                            cursor: "pointer",
+                          }}
+                        >
+                          상세보기
+                        </button>
+
+                        <button
+                          onClick={() => inc(p.id)}
+                          disabled={soldOut}
+                          style={{
+                            height: 44,
+                            borderRadius: 12,
+                            border: `1px solid ${GREEN}`,
+                            background: soldOut ? "#e9e9e9" : GREEN,
+                            color: soldOut ? "#888" : "#fff",
+                            fontWeight: 1000,
+                            cursor: soldOut ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          {soldOut ? "품절" : "담기"}
+                        </button>
+                      </div>
+
+                      {soldOut && <div style={{ marginTop: 8, color: "#b00020", fontWeight: 1000 }}>품절</div>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
+
+        {/* 3) 담은 목록 */}
+        <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 14 }}>
+          <h2 style={{ fontSize: 16, margin: 0, fontWeight: 900 }}>3) 담은 목록</h2>
+
+          {cartItems.length === 0 ? (
+            <p style={{ marginTop: 10, opacity: 0.7 }}>아직 담은 게 없다.</p>
+          ) : (
+            <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+              {cartItems.map(({ product, qty }) => (
+                <div key={product.id} style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <b style={{ wordBreak: "break-word" }}>{product.name}</b> × {qty}
+                  </div>
+                  <div style={{ fontWeight: 1000 }}>{((product.price ?? 0) * qty).toLocaleString()}원</div>
+                </div>
+              ))}
+
+              <div style={{ borderTop: "1px solid #eee", paddingTop: 10, display: "flex", justifyContent: "space-between" }}>
+                <div style={{ fontWeight: 1000 }}>총합</div>
+                <div style={{ fontWeight: 1000, color: "#ff7a00" }}>{totalPrice.toLocaleString()}원</div>
+              </div>
+
+              <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                <button
+                  onClick={resetCart}
+                  style={{
+                    padding: "12px 12px",
+                    borderRadius: 12,
+                    border: "1px solid #ccc",
+                    background: "#fff",
+                    cursor: "pointer",
+                    fontWeight: 1000,
+                  }}
+                >
+                  비우기
+                </button>
+
+                <button
+                  onClick={goCheckout}
+                  style={{
+                    padding: "12px 12px",
+                    borderRadius: 12,
+                    border: `1px solid ${GREEN}`,
+                    background: GREEN,
+                    color: "#fff",
+                    cursor: "pointer",
+                    fontWeight: 1000,
+                    flex: 1,
+                  }}
+                >
+                  다음(주문하기)
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* 상세보기 모달 */}
+      {detailOpen && detailProduct && (
+        <div
+          onClick={closeDetail}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "flex-end",
+            padding: 12,
+            zIndex: 9999,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "100%",
+              maxWidth: 560,
+              background: "#fff",
+              borderRadius: 18,
+              overflow: "hidden",
+              border: "1px solid #eee",
+            }}
+          >
+            <div style={{ padding: 12 }}>
+              <div style={{ width: "100%", height: thumbHeight, background: "#f6f6f6", borderRadius: 14, overflow: "hidden", border: "1px solid #eee" }}>
+                {detailProduct.thumbnail_url ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={detailProduct.thumbnail_url}
+                    alt={detailProduct.name}
+                    style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center", display: "block" }}
+                  />
+                ) : (
+                  <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", opacity: 0.6 }}>No Image</div>
+                )}
+              </div>
+            </div>
+
+            <div style={{ padding: 14, paddingTop: 0 }}>
+              <div style={{ fontSize: 18, fontWeight: 1000, lineHeight: 1.25 }}>{detailProduct.name}</div>
+
+              <div style={{ display: "flex", gap: 12, alignItems: "baseline", marginTop: 6 }}>
+                <div style={{ fontSize: 21, fontWeight: 1000, color: "#ff7a00" }}>{(detailProduct.price ?? 0).toLocaleString()}원</div>
+                <div style={{ fontSize: 21, color: "#777", fontWeight: 1000 }}>재고 {(detailProduct.stock ?? 0).toLocaleString()}</div>
+              </div>
+
+              <div style={{ marginTop: 10, color: "#444", lineHeight: 1.5 }}>임시 설명</div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 12 }}>
+                <button onClick={closeDetail} style={{ height: 46, borderRadius: 12, border: "1px solid #ccc", background: "#fff", fontWeight: 1000, cursor: "pointer" }}>
+                  닫기
+                </button>
+                <button
+                  onClick={() => {
+                    inc(detailProduct.id);
+                    closeDetail();
+                  }}
+                  disabled={(detailProduct.stock ?? 0) <= 0}
+                  style={{
+                    height: 46,
+                    borderRadius: 12,
+                    border: `1px solid ${GREEN}`,
+                    background: (detailProduct.stock ?? 0) <= 0 ? "#e9e9e9" : GREEN,
+                    color: (detailProduct.stock ?? 0) <= 0 ? "#888" : "#fff",
+                    fontWeight: 1000,
+                    cursor: (detailProduct.stock ?? 0) <= 0 ? "not-allowed" : "pointer",
+                  }}
+                >
+                  담고 닫기
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
-    </div>
+    </main>
   );
 }
